@@ -6,5 +6,15 @@ fastapi>=0.115            # [0.127.0]
 uvicorn>=0.30             # [0.40.0]
 pydantic>=2.7,<3          # [2.12.5]
 
-# Only needed by local_evaluator.py.
+# Also used by answering.py to talk to the local llama-server.
 requests>=2.31            # [2.32.5]
+
+# ASR: Parakeet TDT 0.6B via ONNX; faster-whisper only for its MP3 decoder
+# (and the Whisper comparison in transcribe_all.py).
+onnx-asr[cpu,hub]>=0.12   # [0.12.0]
+faster-whisper>=1.1       # [1.2.1]
+
+# The answering LLM is not a pip package: it is llama.cpp's llama-server
+# (models/llama-cpp-vulkan/, release b11029, win-vulkan-x64) running
+# models/gemma-4-E4B-it-Q4_K_M.gguf (unsloth/gemma-4-E4B-it-GGUF).
+# See llm_server.py for the env vars to point it elsewhere.
