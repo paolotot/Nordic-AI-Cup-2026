@@ -16,6 +16,7 @@ import json
 import time
 from pathlib import Path
 
+import answering
 import llm_server
 from answering import answer_questions, split_lines
 from utils import gold_evidence, group_questions_by_conversation, temporal_iou
@@ -41,7 +42,15 @@ def main():
     parser.add_argument('--ctx', type=int, default=8192)
     parser.add_argument('--cpu', action='store_true', help='CPU build instead of the iGPU (Vulkan)')
     parser.add_argument('--cite-rule', default=None, help='key of answering.CITE_RULES')
+    parser.add_argument('--split', default=None, help="answering.LINE_SPLIT: 'sentence' or 'clause'")
+    parser.add_argument('--tag', default='', help='suffix for the output file name')
+    parser.add_argument('--questions-first', action='store_true')
+    parser.add_argument('--few-shot', action='store_true')
     args = parser.parse_args()
+    if args.split:
+        answering.LINE_SPLIT = args.split
+    answering.QUESTIONS_FIRST = args.questions_first
+    answering.USE_FEW_SHOT = args.few_shot
 
     (HERE / 'outputs').mkdir(exist_ok=True)
     tdir = HERE / 'transcripts' / args.transcripts
@@ -106,7 +115,7 @@ def main():
     print(f'  SCORE          {0.4 * acc + 0.6 * miou:.3f}')
     print(f'  time/conv      mean {sum(times) / len(times):.1f}s  max {max(times):.1f}s')
 
-    out = HERE / 'outputs' / f'answers-{args.model.stem}-{args.transcripts}-{args.cite_rule or "default"}.json'
+    out = HERE / 'outputs' / f'answers-{args.model.stem}-{args.transcripts}-{args.cite_rule or "default"}{args.tag}.json'
     out.write_text(json.dumps(records, indent=1))
     print(f'  per-question records: {out.relative_to(HERE)}')
 
