@@ -40,6 +40,7 @@ def main():
     parser.add_argument('--threads', type=int, default=0)
     parser.add_argument('--ctx', type=int, default=8192)
     parser.add_argument('--cpu', action='store_true', help='CPU build instead of the iGPU (Vulkan)')
+    parser.add_argument('--cite-rule', default=None, help='key of answering.CITE_RULES')
     args = parser.parse_args()
 
     (HERE / 'outputs').mkdir(exist_ok=True)
@@ -63,7 +64,8 @@ def main():
             questions = [r['question'] for r in rows]
             t0 = time.perf_counter()
             try:
-                answers, spans, debug = answer_questions(segments, questions, timeout=120)
+                answers, spans, debug = answer_questions(segments, questions, timeout=120,
+                                                         cite_rule=args.cite_rule)
             except Exception as e:  # scored as the fallback would be
                 print(f'{transcript_id}: FAILED {e!r}')
                 answers, spans, debug = [True] * len(rows), [None] * len(rows), {}
@@ -104,7 +106,7 @@ def main():
     print(f'  SCORE          {0.4 * acc + 0.6 * miou:.3f}')
     print(f'  time/conv      mean {sum(times) / len(times):.1f}s  max {max(times):.1f}s')
 
-    out = HERE / 'outputs' / f'answers-{args.model.stem}-{args.transcripts}.json'
+    out = HERE / 'outputs' / f'answers-{args.model.stem}-{args.transcripts}-{args.cite_rule or "default"}.json'
     out.write_text(json.dumps(records, indent=1))
     print(f'  per-question records: {out.relative_to(HERE)}')
 

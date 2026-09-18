@@ -45,14 +45,26 @@ def split_lines(segments: List[dict]) -> List[dict]:
     return [l for l in lines if l['text']]
 
 
-SYSTEM_PROMPT = """You check yes/no questions against the transcript of a recorded doctor-patient consultation.
+CITE_RULES = {
+    # v1: what scored 0.745 locally / 0.712 on validation
+    'minimal': """1. Find the transcript lines that the question is about. Cite the smallest set of consecutive lines that contains the answer - usually one to three lines. Do not cite lines that are merely on the same general topic.""",
+    # v2: annotations often cover a whole exchange, not just the answer line
+    'exchange': """1. Find the passage that establishes the answer and cite all of its consecutive lines. When the fact comes out of an exchange - a question and the reply to it, or an examination followed by its finding - cite the whole exchange, from the line that raises it to the line that settles it. Do not add lines that only acknowledge or repeat it ("Yes.", "Okay.", a number said again), and do not cite lines that are merely on the same general topic.""",
+}
+CITE_RULE = 'minimal'
+
+SYSTEM_PROMPT_TEMPLATE = """You check yes/no questions against the transcript of a recorded doctor-patient consultation.
 
 For each question:
-1. Find the transcript lines that the question is about. Cite the smallest set of consecutive lines that contains the answer - usually one to three lines. Do not cite lines that are merely on the same general topic.
+{cite_rule}
 2. Answer true ONLY if those lines establish exactly what the question states. Check every detail: drug name, dose, number, unit, frequency, duration, body side and location, test result, who said or did what, and whether something was actually agreed or only mentioned.
 3. Answer false if any detail differs (for example 200 mg when the transcript says 100 mg, six weeks when it says two weeks, left knee when it says right knee), if it was never mentioned, or if it contradicts the transcript. For a false answer, cite the lines that show the conflict, or none if the subject never comes up.
 
 The transcript is automatic speech recognition, so drug names and surnames may be misspelled; treat close-sounding spellings as the same word. The question's phrasing (plain question, "right?", "didn't it?") tells you nothing about the answer."""
+
+
+def system_prompt(cite_rule: str = None) -> str:
+    return SYSTEM_PROMPT_TEMPLATE.format(cite_rule=CITE_RULES[cite_rule or CITE_RULE])
 
 
 def build_prompt(lines: List[dict], questions: List[str]) -> str:
@@ -179,6 +191,18 @@ def trim_span(lines: List[dict], cited: List[int], question: str,
     return words[first]['start'], words[last]['end']
 
 
+# Annotators start a touch before the first word and end a touch after the
+# last; fitted on the 195 training spans (tIoU 0.590 -> 0.598).
+PAD_START_S = 0.10
+PAD_END_S = 0.05
+
+
+def pad(span: Optional[Span]) -> Optional[Span]:
+    if span is None:
+        return None
+    return max(0.0, span[0] - PAD_START_S), span[1] + PAD_END_S
+
+
 def keyword_fallback(segments: List[dict], questions: List[str]
                      ) -> Tuple[List[bool], List[Optional[Span]]]:
     """No-LLM guess, for when the model is down or out of time.
@@ -217,6 +241,7 @@ def answer_questions(
     questions: List[str],
     server: str = 'http://127.0.0.1:8080',
     timeout: float = 45,
+    cite_rule: Optional[str] = None,
 ) -> Tuple[List[bool], List[Optional[Span]], dict]:
     """Ask the local LLM every question in one call.
 
@@ -226,7 +251,7 @@ def answer_questions(
     lines = split_lines(segments)
     body = {
         'messages': [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'system', 'content': system_prompt(cite_rule)},
             {'role': 'user', 'content': build_prompt(lines, questions)},
         ],
         'temperature': 0,
@@ -242,7 +267,7 @@ def answer_questions(
     answers, spans = [], []
     for question, (yes, cited) in zip(questions, parse_rows(raw, len(questions))):
         answers.append(yes)
-        spans.append(trim_span(lines, cited, question) if yes else None)
+        spans.append(pad(trim_span(lines, cited, question)) if yes else None)
 
     debug = {'raw': raw, 'lines': lines, 'usage': out.get('usage'),
              'timings': out.get('timings')}

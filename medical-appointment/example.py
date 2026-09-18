@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # network, base64 and JSON on both sides.
 REQUEST_BUDGET_S = 52.0
 MIN_LLM_S = 4.0  # below this there is no point starting the LLM call
+# Stop ASR here (partial transcript) so the LLM keeps ~20 s even when the
+# machine is running slow; the answer step took up to 19 s in a slow run.
+ASR_DEADLINE_S = 30.0
 
 
 # --------------------------------------------------------------------------- #
@@ -80,9 +83,11 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     answers: List[bool] = [True] * n
     spans: List[Optional[tuple]] = [None] * n
     how = 'guess'
+    t_asr = float('nan')
 
     try:
-        segments = asr.transcribe(ASR_MODEL, decode_audio(request.audio_base64))
+        segments = asr.transcribe(ASR_MODEL, decode_audio(request.audio_base64),
+                                  deadline=t0 + ASR_DEADLINE_S)
         t_asr = time.perf_counter() - t0
 
         remaining = REQUEST_BUDGET_S - t_asr
@@ -101,9 +106,10 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
         logger.exception('ASR failed for %s, returning a guess', request.audio_filename)
 
     spans = [_clean(s) if a else None for a, s in zip(answers, spans)]
-    logger.info('%s: %d questions, %d yes, via %s, %.1fs total',
+    t_total = time.perf_counter() - t0
+    logger.info('%s: %d questions, %d yes, via %s, asr %.1fs + answer %.1fs = %.1fs total',
                 request.audio_filename, n, sum(answers), how,
-                time.perf_counter() - t0)
+                t_asr, t_total - t_asr, t_total)
 
     return ASRQuestionResponseDto(
         answers=[bool(a) for a in answers],
