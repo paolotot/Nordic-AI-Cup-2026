@@ -1,0 +1,11 @@
+# Same as requirements.txt, but Parakeet runs on an NVIDIA GPU via
+# onnxruntime-gpu (use with ASR_PROVIDER=cuda). Install this INSTEAD of
+# requirements.txt: onnxruntime and onnxruntime-gpu must not both be installed.
+
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7,<3
+requests>=2.31
+
+onnx-asr[gpu,hub]>=0.12
+faster-whisper>=1.1

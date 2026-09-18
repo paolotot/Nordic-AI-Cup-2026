@@ -7,6 +7,7 @@ from Hugging Face once and cached.
 
 import io
 import logging
+import os
 import time
 from typing import List, Optional, Union
 
@@ -20,18 +21,26 @@ SAMPLE_RATE = 16_000
 FRAME_S = 0.08  # Parakeet emits one encoder frame every 80 ms
 
 
-def load(quantization: str = 'int8', threads: int = 6, batch_size: int = 1):
+def load(quantization: str = 'int8', threads: int = None, batch_size: int = 1):
     """Measured on the i7-13700H, longest training file (228 s of audio):
     all threads / batch 8: ~26 s; 6 threads / batch 1: ~16-17 s. Fewer threads
     keep the work on the P-cores; batch 1 avoids padding and makes the ASR
     deadline precise (it can only overrun by one speech chunk).
+
+    Env vars for other machines:
+        ASR_PROVIDER  'cpu' (default) or 'cuda' (NVIDIA; needs onnxruntime-gpu,
+                      see requirements-gpu.txt)
+        ASR_THREADS   CPU threads (default 6; roughly the number of P-cores)
     """
-    # Pinned to CPU: on the Intel iGPU (DirectML) the int8 model is ~4x slower,
+    # Default CPU: on the Intel iGPU (DirectML) the int8 model is ~4x slower,
     # and the iGPU belongs to the LLM anyway.
+    provider = os.environ.get('ASR_PROVIDER', 'cpu').lower()
+    providers = (['CUDAExecutionProvider', 'CPUExecutionProvider'] if provider == 'cuda'
+                 else ['CPUExecutionProvider'])
     options = rt.SessionOptions()
-    options.intra_op_num_threads = threads
+    options.intra_op_num_threads = int(threads or os.environ.get('ASR_THREADS', 6))
     model = onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v2', quantization=quantization,
-                                providers=['CPUExecutionProvider'], sess_options=options)
+                                providers=providers, sess_options=options)
     vad = onnx_asr.load_vad('silero')
     return model.with_vad(vad, batch_size=batch_size, max_speech_duration_s=20,
                           min_silence_duration_ms=300).with_timestamps()

@@ -1,8 +1,9 @@
 """Start and stop the local llama.cpp server that hosts the answering LLM.
 
-Defaults to the Vulkan build on the Intel iGPU (about 3x faster prompt
-processing than the CPU build on this laptop). Override with env vars on
-another machine:
+The llama.cpp build is found automatically under ``models/``, preferring
+``llama-cpp-cuda`` (NVIDIA), then ``llama-cpp-vulkan`` (any GPU, incl. the
+Intel iGPU it was developed on), then ``llama-cpp`` (CPU). The setup scripts
+in ``scripts/`` download them. Override with env vars:
 
     LLAMA_SERVER   path to llama-server(.exe)
     LLAMA_MODEL    path to the GGUF
@@ -18,17 +19,36 @@ from pathlib import Path
 import requests
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SERVER = HERE / 'models' / 'llama-cpp-vulkan' / 'llama-server.exe'
+BUILD_DIRS = ['llama-cpp-cuda', 'llama-cpp-vulkan', 'llama-cpp']
 DEFAULT_MODEL = HERE / 'models' / 'gemma-4-E4B-it-Q4_K_M.gguf'
 PORT = 8080
 URL = f'http://127.0.0.1:{PORT}'
 
 
+def find_server() -> Path:
+    """First llama-server binary under models/<build dir>, GPU builds first.
+
+    Release archives differ in layout (flat on Windows, a subfolder on
+    Linux), so search each build dir recursively.
+    """
+    name = 'llama-server.exe' if os.name == 'nt' else 'llama-server'
+    for d in BUILD_DIRS:
+        hits = sorted((HERE / 'models' / d).rglob(name))
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(
+        f'No {name} under models/{{{",".join(BUILD_DIRS)}}}; run the setup script '
+        'in scripts/ or set LLAMA_SERVER')
+
+
 def start(model=None, server=None, ngl=None, threads=0, ctx=8192,
           log_name=None) -> subprocess.Popen:
     model = Path(model or os.environ.get('LLAMA_MODEL', DEFAULT_MODEL))
-    server = Path(server or os.environ.get('LLAMA_SERVER', DEFAULT_SERVER))
-    ngl = int(ngl if ngl is not None else os.environ.get('LLAMA_NGL', 99))
+    server = Path(server or os.environ.get('LLAMA_SERVER') or find_server())
+    # The CPU-only build cannot offload; everything else gets the whole model.
+    cpu_build = HERE / 'models' / 'llama-cpp'
+    default_ngl = 0 if cpu_build in server.resolve().parents else 99
+    ngl = int(ngl if ngl is not None else os.environ.get('LLAMA_NGL', default_ngl))
 
     (HERE / 'outputs').mkdir(exist_ok=True)
     log = open(HERE / 'outputs' / (log_name or f'llama-server-{model.stem}.log'), 'w')
