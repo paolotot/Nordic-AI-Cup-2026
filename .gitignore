@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Secrets ---
+.env
+*.key
+secrets.*
+
+# --- Model weights (download, don't commit) ---
+models/
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.bin
+*.safetensors
+
+# --- Upstream competition data (large; fetch with scripts/fetch-data.ps1) ---
+medical-appointment/data/audio/
+drone-flyby/src/helsinki/images/
+drone-flyby/images/
+images/
+
+# --- Our own outputs ---
+outputs/
+runs/
+*.log
+transcripts/
+cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Read-only copy of the organisers' repo
+_upstream/
