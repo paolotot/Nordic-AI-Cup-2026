@@ -56,10 +56,11 @@ def main():
     tdir = HERE / 'transcripts' / args.transcripts
     groups = group_questions_by_conversation()[:args.limit]
 
-    proc = llm_server.start(
-        args.model, ctx=args.ctx, threads=args.threads,
-        server=HERE / 'models' / ('llama-cpp' if args.cpu else 'llama-cpp-vulkan') / 'llama-server.exe',
-        ngl=0 if args.cpu else 99)
+    # Same auto-detection as the real server (cuda > vulkan > cpu build);
+    # --cpu forces the CPU build.
+    cpu_server = next((HERE / 'models' / 'llama-cpp').rglob('llama-server*'), None) if args.cpu else None
+    proc = llm_server.start(args.model, ctx=args.ctx, threads=args.threads,
+                            server=cpu_server, ngl=0 if args.cpu else None)
     try:
         # Warm-up, as the real server would do at import time.
         answer_questions([{'start': 0, 'end': 1, 'text': 'Hello.', 'words': []}],

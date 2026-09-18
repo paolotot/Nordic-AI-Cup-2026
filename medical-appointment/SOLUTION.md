@@ -77,6 +77,30 @@ that the score matches ~0.76; if it's far off, something's misconfigured.
 The time limits are constants at the top of [example.py](example.py)
 (`ASR_DEADLINE_S`, `REQUEST_BUDGET_S`).
 
+## Trying another model
+
+Gemma is **not fine-tuned**: it's the stock `unsloth/gemma-4-E4B-it-GGUF`
+file. All the task logic is in the prompt and the code, so any instruct model
+that llama.cpp can run is a drop-in swap:
+
+1. Download a GGUF (Q4_K_M is a good default) into `models/`.
+2. Compare it quickly on cached transcripts. This tests only the answering
+   half, so it's ~10 min instead of a full evaluator run:
+   ```powershell
+   .\.venv\Scripts\python.exe transcribe_parakeet.py      # once: caches transcripts/
+   .\.venv\Scripts\python.exe eval_answering.py models\gemma-4-E4B-it-Q4_K_M.gguf   # baseline: ~0.763
+   .\.venv\Scripts\python.exe eval_answering.py models\<other>.gguf
+   ```
+3. To serve it: set `LLAMA_MODEL=models\<other>.gguf` before `api.py`.
+
+Notes:
+- The reply format is forced by a grammar, so any model's output parses.
+- "Thinking" is switched off via `chat_template_kwargs` (needed for Qwen3.x;
+  ignored by models without it). Reasoning models that can't disable it will
+  be slow and may hit the output token limit.
+- Watch `time/conv` in the output: answering must fit in ~20 s next to speech-to-text.
+- `-c 8192` context is plenty (prompts are ~1-2k tokens).
+
 ## Going live
 
 The evaluator needs a public URL. Easiest, from the machine running `api.py`:
