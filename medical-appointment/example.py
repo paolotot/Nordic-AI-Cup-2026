@@ -31,11 +31,13 @@ logger = logging.getLogger(__name__)
 
 # The evaluator allows 60 s per request from the POST; keep a margin for
 # network, base64 and JSON on both sides.
-REQUEST_BUDGET_S = 52.0
+REQUEST_BUDGET_S = 55.0
 MIN_LLM_S = 4.0  # below this there is no point starting the LLM call
-# Stop ASR here (partial transcript) so the LLM keeps ~20 s even when the
-# machine is running slow; the answer step took up to 19 s in a slow run.
-ASR_DEADLINE_S = 30.0
+# Stop ASR here (partial transcript) so the LLM keeps ~18 s even when the
+# machine is running slow. Worst seen: ASR overshoots its deadline by ~4 s
+# (it finishes the current VAD batch), answering takes up to ~18 s, so
+# 33 + 4 + 18 = 55 s, plus network, under the evaluator's 60 s.
+ASR_DEADLINE_S = 33.0
 
 
 # --------------------------------------------------------------------------- #

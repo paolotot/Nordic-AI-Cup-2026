@@ -34,7 +34,12 @@ def start(model=None, server=None, ngl=None, threads=0, ctx=8192,
     log = open(HERE / 'outputs' / (log_name or f'llama-server-{model.stem}.log'), 'w')
     cmd = [str(server), '-m', str(model), '--port', str(PORT), '-c', str(ctx),
            '--no-webui', '-np', '1', '-ngl', str(ngl)]
-    if threads:
+    if ngl > 0:
+        # Fully offloaded: the CPU threads only feed the iGPU. Few threads and
+        # no spin-polling, or they steal cores from the next request's ASR
+        # (measured: ASR 33.3 s -> 29.7 s after an answer, answer time same).
+        cmd += ['-t', str(threads or 4), '--poll', '0']
+    elif threads:
         cmd += ['-t', str(threads)]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     atexit.register(proc.terminate)
