@@ -1,8 +1,12 @@
 """One request in, one response out, with state carried across the sequence."""
 
+import base64
+import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from dtos import (
     DroneFlybyPredictionDto,
@@ -25,6 +29,11 @@ class Pipeline:
         self.detector = load_detector(self.detector_name, os.environ.get('FLYBY_WEIGHTS', ''))
         self.detector.warm_up()
         self.sequence_id = None
+        # FLYBY_RECORD=<dir>: keep every received view (allowed for validation
+        # runs) for retraining. Written on a worker thread, off the answer path.
+        record = os.environ.get('FLYBY_RECORD', '')
+        self.recorder = ThreadPoolExecutor(max_workers=1) if record else None
+        self.record_dir = Path(record) if record else None
         logger.info('pipeline ready: detector=%s camera=%s', self.detector_name, self.camera_name)
 
     def _reset(self, sequence_id):
@@ -40,6 +49,8 @@ class Pipeline:
 
         started = time.perf_counter()
         view = request.view
+        if self.recorder is not None:
+            self.recorder.submit(self._record, request)
         region = tuple(view.source_region_xyxy)
         annotations, command = [], None
         try:
@@ -66,6 +77,17 @@ class Pipeline:
             requested_view=RequestedViewDto(resolution_level=command[0], center_x=command[1],
                                             center_y=command[2]) if command else None,
         )
+
+    def _record(self, request):
+        try:
+            folder = self.record_dir / request.sequence_id.replace(':', '_')
+            folder.mkdir(parents=True, exist_ok=True)
+            stem = f'{request.frame_index:04d}_f{request.frame}'
+            (folder / f'{stem}.png').write_bytes(base64.b64decode(request.view.image))
+            meta = request.model_dump(exclude={'view': {'image'}})
+            (folder / f'{stem}.json').write_text(json.dumps(meta))
+        except Exception:
+            logger.exception('recording frame %s failed', request.frame)
 
     def _annotations(self, request):
         out = []
