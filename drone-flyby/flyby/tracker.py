@@ -82,16 +82,28 @@ class Tracker:
         self.frame = None
 
     def advance_to(self, frame):
-        if self.frame is not None and frame > self.frame:
+        """Move every track to `frame`. Older frames (late requests) move nothing."""
+        if self.frame is None:
+            self.frame = frame
+        elif frame > self.frame:
             steps = frame - self.frame
             for track in self.tracks:
                 track.box = self.motion.advance(track.box, steps)
             self.tracks = [t for t in self.tracks
                            if t.box[1] < IMAGE_HEIGHT and t.box[3] > 0
                            and t.box[0] < IMAGE_WIDTH and t.box[2] > 0]
-        self.frame = frame
+            self.frame = frame
 
     def update(self, detections: List[Detection], region, level, frame):
+        stale = self.frame is not None and frame < self.frame
+        if stale:
+            # A late request (the evaluator does not wait for our answers):
+            # carry its detections forward to where the tracks are now, and
+            # neither count misses nor learn motion from it.
+            steps = self.frame - frame
+            for detection in detections:
+                detection.box = self.motion.advance(detection.box, steps)
+            frame = self.frame
         pairs = []
         for d_index, detection in enumerate(detections):
             for t_index, track in enumerate(self.tracks):
@@ -108,13 +120,16 @@ class Tracker:
                 continue
             used_d.add(d_index)
             used_t.add(t_index)
-            self._apply(self.tracks[t_index], detections[d_index], frame)
+            self._apply(self.tracks[t_index], detections[d_index], frame, learn=not stale)
 
         for d_index, detection in enumerate(detections):
             if d_index not in used_d:
                 track = Track(next(self.ids), detection.box.copy())
-                self._apply(track, detection, frame)
+                self._apply(track, detection, frame, learn=not stale)
                 self.tracks.append(track)
+        if stale:
+            self.tracks = self._merge(self.tracks)
+            return
 
         factor = 4 / 2 ** level
         survivors = []
@@ -130,10 +145,10 @@ class Tracker:
             survivors.append(track)
         self.tracks = self._merge(survivors)
 
-    def _apply(self, track: Track, detection: Detection, frame):
+    def _apply(self, track: Track, detection: Detection, frame, learn=True):
         if not detection.cut_off:
             centre = detection.centre
-            if track.last_centre is not None and track.last_centre_frame < frame:
+            if learn and track.last_centre is not None and track.last_centre_frame < frame:
                 self.motion.observe(frame, track.last_centre, centre,
                                     frame - track.last_centre_frame)
             track.last_centre, track.last_centre_frame = centre, frame
@@ -164,12 +179,14 @@ class Tracker:
     def annotations(self, frame):
         """(class name, source box, confidence) for every live track."""
         out = []
+        back = frame - self.frame if self.frame is not None and frame < self.frame else 0
         for track in self.tracks:
             if track.votes.sum() <= 0:
                 continue
-            age = frame - track.last_seen
+            age = max(0, frame - track.last_seen)
             confidence = ((1 - np.exp(-track.strength / 0.8)) * (0.5 + 0.5 * track.purity)
                           * 0.985 ** age)
-            out.append((OBJECT_CLASSES[int(track.votes.argmax())], track.box,
+            box = self.motion.advance(track.box, back) if back else track.box
+            out.append((OBJECT_CLASSES[int(track.votes.argmax())], box,
                         float(np.clip(confidence, 0.001, 0.999))))
         return out

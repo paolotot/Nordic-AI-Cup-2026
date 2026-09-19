@@ -41,14 +41,22 @@ class GroundMotion:
                 self.y[0] + self.y[1] * (y - HALF_H) / HALF_H)
 
     def advance(self, box, frames):
-        """Move a source-pixel box forward by a number of frames."""
+        """Move a source-pixel box by a number of frames (negative = back in time)."""
         x1, y1, x2, y2 = box
         cx, cy, w, h = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
         grow_x, grow_y = 1 + self.x[1] / HALF_W, 1 + self.y[1] / HALF_H
-        for _ in range(frames):
-            dx, dy = self.velocity(cx, cy)
-            cx, cy = cx + dx, cy + dy
-            w, h = w * grow_x, h * grow_y
+        for _ in range(abs(frames)):
+            if frames > 0:
+                dx, dy = self.velocity(cx, cy)
+                cx, cy = cx + dx, cy + dy
+                w, h = w * grow_x, h * grow_y
+            else:
+                # Invert one step: find the point whose forward step lands here.
+                dx, dy = self.velocity(cx, cy)
+                px, py = cx - dx, cy - dy
+                dx, dy = self.velocity(px, py)
+                cx, cy = cx - dx, cy - dy
+                w, h = w / grow_x, h / grow_y
         return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
 
     def observe(self, frame, before, after, frames):

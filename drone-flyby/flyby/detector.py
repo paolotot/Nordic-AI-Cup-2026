@@ -1,4 +1,4 @@
-"""Detectors: turn one transmitted view into detections in source pixels.
+﻿"""Detectors: turn one transmitted view into detections in source pixels.
 
 * ``YoloDetector``   - the real one. Loads a trained .pt or an OpenVINO export.
 * ``OracleDetector`` - a stand-in built from the helsinki annotations, so the

@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -21,6 +22,9 @@ from utils import clip_bbox_to_frame, decode_view, source_bbox_to_global
 
 logger = logging.getLogger(__name__)
 
+# A frame holds ~10-20 real objects; beyond this, extra boxes are mostly noise.
+MAX_ANSWERS = 60
+
 
 class Pipeline:
     def __init__(self):
@@ -29,6 +33,7 @@ class Pipeline:
         self.detector = load_detector(self.detector_name, os.environ.get('FLYBY_WEIGHTS', ''))
         self.detector.warm_up()
         self.sequence_id = None
+        self.lock = threading.Lock()
         # FLYBY_RECORD=<dir>: keep every received view (allowed for validation
         # runs) for retraining. Written on a worker thread, off the answer path.
         record = os.environ.get('FLYBY_RECORD', '')
@@ -42,6 +47,12 @@ class Pipeline:
         self.policy = load_policy(self.camera_name)
 
     def predict(self, request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDto:
+        # The evaluator does not wait for our answer before sending the next
+        # frame, so requests can overlap; the tracker is shared state.
+        with self.lock:
+            return self._predict(request)
+
+    def _predict(self, request: DroneFlybyPredictRequestDto) -> DroneFlybyPredictResponseDto:
         if request.sequence_id != self.sequence_id:
             self._reset(request.sequence_id)
         if request.camera_command_feedback is not None:
@@ -54,12 +65,19 @@ class Pipeline:
         region = tuple(view.source_region_xyxy)
         annotations, command = [], None
         try:
+            stale = self.tracker.frame is not None and request.frame < self.tracker.frame
             self.tracker.advance_to(request.frame)
             detections = self.detector(decode_view(view), region, view.resolution_level,
                                        request.frame)
             self.tracker.update(detections, region, view.resolution_level, request.frame)
             annotations = self._annotations(request)
-            command = self.policy.next_view(request, self.tracker, request.frame)
+            if stale:
+                # A newer frame already moved the camera; a command computed
+                # from this older view would be refused or undo that move.
+                logger.info('late request for frame %s (at %s): no camera command',
+                            request.frame, self.tracker.frame)
+            else:
+                command = self.policy.next_view(request, self.tracker, request.frame)
         except Exception:
             # An exception would lose the frame; an empty answer still scores it.
             logger.exception('pipeline failed on frame %s', request.frame)
@@ -99,4 +117,4 @@ class Pipeline:
             out.append(DroneFlybyPredictionDto(object_id=name, bbox=[round(c, 6) for c in bbox],
                                                confidence=round(confidence, 4)))
         out.sort(key=lambda a: -a.confidence)
-        return out[:500]
+        return out[:MAX_ANSWERS]
