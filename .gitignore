@@ -42,3 +42,6 @@ Thumbs.db
 
 # Read-only copy of the organisers' repo
 _upstream/
+
+# Drone flyby generated data (cutouts, synthetic sets, recordings)
+drone-flyby/data/
