@@ -10,6 +10,7 @@ Prints the camera path, what each frame's answer got right, and AP per class.
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,9 +40,12 @@ def main():
     pipeline = Pipeline()
     camera = Camera()
     predictions = {}
+    timings = []
     for index, frame in enumerate(frame_numbers()):
         payload = build_request(frame, index, camera, render_view(load_frame(frame), camera), None)
+        started = time.perf_counter()
         response = pipeline.predict(DroneFlybyPredictRequestDto.model_validate(payload))
+        timings.append((time.perf_counter() - started) * 1000)
         boxes = [(a.object_id, global_bbox_to_source(a.bbox), a.confidence)
                  for a in response.annotations]
         predictions[frame] = [{'object_id': n, 'bbox': b, 'confidence': c} for n, b, c in boxes]
@@ -77,6 +81,7 @@ def main():
     total, per_class = score('helsinki', predictions)
     print('\nAP by class: ' + ', '.join(f'{k} {v:.2f}' for k, v in
                                          sorted(per_class.items(), key=lambda kv: -kv[1])))
+    print(f'pipeline ms per frame: median {np.median(timings):.0f}, max {max(timings):.0f}')
     print(f'mAP@0.50: {total:.3f}')
 
 

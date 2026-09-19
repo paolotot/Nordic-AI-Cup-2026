@@ -51,6 +51,9 @@ class YoloDetector:
         from ultralytics import YOLO
         self.model = YOLO(weights, task='detect')
         self.confidence = confidence
+        # For OpenVINO exports, plain 'cpu' lets OpenVINO pick 'AUTO', which
+        # tries the Iris Xe iGPU and hangs compiling there. Pin the CPU.
+        self.device = 'intel:cpu' if 'openvino' in str(weights) else 'cpu'
 
     def warm_up(self):
         blank = np.zeros((TRANSMITTED_VIEW_SIZE[1], TRANSMITTED_VIEW_SIZE[0], 3), np.uint8)
@@ -59,7 +62,7 @@ class YoloDetector:
 
     def __call__(self, image, region, level, frame) -> List[Detection]:
         result = self.model.predict(image, imgsz=(544, 960), conf=self.confidence, iou=0.5,
-                                    agnostic_nms=True, max_det=200, device='cpu',
+                                    agnostic_nms=True, max_det=200, device=self.device,
                                     verbose=False)[0]
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
