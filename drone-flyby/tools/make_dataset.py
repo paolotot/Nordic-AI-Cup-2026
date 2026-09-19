@@ -1,21 +1,30 @@
-"""Build a YOLO training set from the helsinki frames plus copy-paste.
+﻿"""Build a YOLO training set by copy-paste, from two kinds of background.
 
-Each sample is a random camera view (level 0, 1 or 2) of a real 4K frame:
-* the real objects already in that view keep their real labels;
-* a handful of cutouts (tools/make_cutouts.py) are pasted onto empty ground,
-  randomly rotated, flipped, rescaled and relit, classes balanced;
-* the view is then downsampled to 960x540 exactly as the evaluator does it.
+1. helsinki views: a random camera view (level 0, 1 or 2) of a supplied 4K
+   frame. Real objects keep their real labels; cutouts are pasted at source
+   scale and the view is downsampled exactly as the evaluator does it.
+2. recorded validation views (data/recordings/validation, if present): the
+   960x540 images the evaluator actually sent us. Harbours, cars and roofs we
+   must learn to ignore. Spots the old model was confident about (.mask.json)
+   are painted over unless the view has hand labels (.labels.json), which then
+   become real labels. Cutouts are scaled down to the view's level first.
 
-Train views come from frames 0-19 and val views from frames 20-24. The two
-overlap in ground (the drone only moves ~65 px per frame), so val is a sanity
-check; the real test is a validation run on the competition server.
+Pasted cutouts are rotated, flipped, rescaled, strongly relit and (mostly)
+given a cast shadow from a per-image sun direction, because the validation
+scene renders shadows and helsinki does not.
 
-    python tools/make_dataset.py                       # data/synth, 3000 + 300
-    python tools/make_dataset.py --train 200 --val 50  # quick
+Train/val: helsinki frames 0-19 / 20-24; recordings of the full validation run
+/ the earlier partial run. Both overlap their train side in ground, so val is
+a sanity check; the real test is a validation run.
+
+    python tools/make_dataset.py                             # data/synth
+    python tools/make_dataset.py --train 200 --rec-train 200 --val 50 --rec-val 50
 """
 
 import argparse
 import functools
+import glob
+import json
 import sys
 from pathlib import Path
 
@@ -33,11 +42,14 @@ from utils import (  # noqa: E402
 )
 
 CUTOUTS = ROOT / 'data' / 'cutouts'
+RECORDINGS = ROOT / 'data' / 'recordings' / 'validation'
 OUT = ROOT / 'data' / 'synth'
 LEVEL_WEIGHTS = {0: 0.3, 1: 0.35, 2: 0.35}
 PASTES_PER_VIEW = {0: (6, 14), 1: (3, 8), 2: (1, 4)}
+DOWNSAMPLE = {0: 4, 1: 2, 2: 1}
 MIN_VISIBLE = 0.5      # label a real object if this much of it is in view
 MIN_LABEL_PX = 3       # drop labels smaller than this in the transmitted image
+NO_SHADOW_SHARE = 0.25
 
 
 def load_cutouts():
@@ -53,12 +65,18 @@ def load_cutouts():
 
 
 def augment(rgba, is_patch, rng):
-    """Rotate/flip/scale/relight one cutout. Patches only turn by 90 degrees so
-    their ground stays a clean rectangle."""
+    """Rotate/flip/scale/relight one cutout at source scale. Patches only turn
+    by 90 degrees so their ground stays a clean rectangle."""
     if rng.random() < 0.5:
         rgba = rgba[:, ::-1]
     if is_patch:
-        rgba = np.rot90(rgba, rng.integers(4))
+        rgba = np.rot90(rgba, rng.integers(4)).copy()
+        # Fade the patch's own (helsinki) ground out toward its edges, so no
+        # hard square gives the paste away.
+        h, w = rgba.shape[:2]
+        fade_y = np.clip(np.minimum(np.arange(h), np.arange(h)[::-1]) / max(1, 0.2 * h), 0, 1)
+        fade_x = np.clip(np.minimum(np.arange(w), np.arange(w)[::-1]) / max(1, 0.2 * w), 0, 1)
+        rgba[:, :, 3] = (rgba[:, :, 3] * np.outer(fade_y, fade_x)).astype(np.uint8)
     else:
         h, w = rgba.shape[:2]
         angle = rng.uniform(0, 360)
@@ -74,12 +92,38 @@ def augment(rgba, is_patch, rng):
     rgba = cv2.resize(np.ascontiguousarray(rgba),
                       (max(2, round(w * scale)), max(2, round(h * scale))),
                       interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-    colour = rgba[:, :, :3].astype(np.float32)
-    colour = colour * rng.uniform(0.8, 1.2) + rng.uniform(-15, 15)
-    colour *= rng.uniform(0.93, 1.07, size=3)          # slight tint
-    rgba[:, :, :3] = np.clip(colour, 0, 255).astype(np.uint8)
+    colour = rgba[:, :, :3].astype(np.float32) / 255
+    colour = colour ** rng.uniform(0.7, 1.4)                      # gamma
+    colour = colour * rng.uniform(0.6, 1.3) + rng.uniform(-0.08, 0.08)
+    colour *= rng.uniform(0.9, 1.1, size=3)                       # tint
+    grey = colour.mean(axis=2, keepdims=True)
+    colour = grey + (colour - grey) * rng.uniform(0.6, 1.3)       # saturation
+    rgba[:, :, :3] = np.clip(colour * 255, 0, 255).astype(np.uint8)
+    if rng.random() < 0.2:
+        rgba[:, :, :3] = cv2.GaussianBlur(rgba[:, :, :3], (3, 3), 0)
     ys, xs = np.nonzero(rgba[:, :, 3] > 40)
     return rgba[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def paste(view, rgba, px, py, shadow):
+    """Alpha-blend rgba at (px, py), after darkening the ground under its
+    shadow. shadow = (dx, dy, strength) in view pixels, or None."""
+    height, width = view.shape[:2]
+    h, w = rgba.shape[:2]
+    alpha = rgba[:, :, 3].astype(np.float32) / 255
+    if shadow is not None:
+        dx, dy, strength = shadow
+        k = max(1, int(0.12 * max(h, w))) | 1
+        soft = cv2.GaussianBlur(alpha, (k, k), 0) if k > 1 else alpha
+        sx, sy = px + int(round(dx)), py + int(round(dy))
+        x1, y1, x2, y2 = max(0, sx), max(0, sy), min(width, sx + w), min(height, sy + h)
+        if x2 > x1 and y2 > y1:
+            s = soft[y1 - sy:y2 - sy, x1 - sx:x2 - sx, None]
+            region = view[y1:y2, x1:x2].astype(np.float32)
+            view[y1:y2, x1:x2] = (region * (1 - strength * s)).astype(np.uint8)
+    a = alpha[:, :, None]
+    region = view[py:py + h, px:px + w].astype(np.float32)
+    view[py:py + h, px:px + w] = (rgba[:, :, :3] * a + region * (1 - a)).astype(np.uint8)
 
 
 def overlaps(box, boxes, margin=8):
@@ -87,12 +131,66 @@ def overlaps(box, boxes, margin=8):
                box[1] < b[3] + margin and b[1] < box[3] + margin for b in boxes)
 
 
+def sun(rng):
+    """Per-image shadow direction, length (x object size) and darkness."""
+    if rng.random() < NO_SHADOW_SHARE:
+        return None
+    return rng.uniform(0, 2 * np.pi), rng.uniform(0.15, 0.6), rng.uniform(0.3, 0.65)
+
+
+def paste_many(view, cutouts, level, rng, occupied, labels, downsample):
+    """Paste a level-appropriate number of cutouts, scaled down by `downsample`."""
+    height, width = view.shape[:2]
+    light = sun(rng)
+    low, high = PASTES_PER_VIEW[level]
+    for _ in range(int(rng.integers(low, high + 1))):
+        name = OBJECT_CLASSES[rng.integers(len(OBJECT_CLASSES))]
+        rgba, is_patch = cutouts[name][rng.integers(len(cutouts[name]))]
+        rgba = augment(rgba, is_patch, rng)
+        if downsample > 1:
+            h, w = rgba.shape[:2]
+            rgba = cv2.resize(np.ascontiguousarray(rgba), (max(2, round(w / downsample)), max(2, round(h / downsample))),
+                              interpolation=cv2.INTER_AREA)
+        h, w = rgba.shape[:2]
+        if w >= width or h >= height:
+            continue
+        for _attempt in range(20):
+            px, py = int(rng.integers(0, width - w)), int(rng.integers(0, height - h))
+            box = (px, py, px + w, py + h)
+            if not overlaps(box, occupied):
+                break
+        else:
+            continue
+        shadow = None
+        if light is not None:
+            angle, length, strength = light
+            reach = length * max(h, w)
+            shadow = (np.cos(angle) * reach, np.sin(angle) * reach,
+                      strength * (0.5 if is_patch else 1.0))
+        paste(view, rgba, px, py, shadow)
+        occupied.append(box)
+        labels.append((name, box))
+
+
+def yolo_lines(labels, factor):
+    lines = []
+    for name, (bx1, by1, bx2, by2) in labels:
+        w, h = (bx2 - bx1) / factor, (by2 - by1) / factor
+        if max(w, h) < MIN_LABEL_PX:
+            continue
+        cxn = (bx1 + bx2) / 2 / factor / TRANSMITTED_VIEW_SIZE[0]
+        cyn = (by1 + by2) / 2 / factor / TRANSMITTED_VIEW_SIZE[1]
+        lines.append(f'{OBJECT_CLASSES.index(name)} {cxn:.6f} {cyn:.6f} '
+                     f'{w / TRANSMITTED_VIEW_SIZE[0]:.6f} {h / TRANSMITTED_VIEW_SIZE[1]:.6f}')
+    return lines
+
+
 @functools.lru_cache(maxsize=None)
 def cached_frame(frame):
     return load_frame(frame)
 
 
-def make_view(frame, level, cutouts, rng):
+def helsinki_view(frame, level, cutouts, rng):
     image = cached_frame(frame)
     min_x, max_x, min_y, max_y = center_bounds_for_level(level)
     cx, cy = int(rng.integers(min_x, max_x + 1)), int(rng.integers(min_y, max_y + 1))
@@ -111,67 +209,118 @@ def make_view(frame, level, cutouts, rng):
             labels.append((a['object_id'], (inter[0] - x1, inter[1] - y1,
                                             inter[2] - x1, inter[3] - y1)))
 
+    paste_many(view, cutouts, level, rng, occupied, labels, downsample=1)
     height, width = view.shape[:2]
-    low, high = PASTES_PER_VIEW[level]
-    for _ in range(int(rng.integers(low, high + 1))):
-        name = OBJECT_CLASSES[rng.integers(len(OBJECT_CLASSES))]
-        rgba, is_patch = cutouts[name][rng.integers(len(cutouts[name]))]
-        rgba = augment(rgba, is_patch, rng)
-        h, w = rgba.shape[:2]
-        if w >= width or h >= height:
-            continue
-        for _attempt in range(20):
-            px, py = int(rng.integers(0, width - w)), int(rng.integers(0, height - h))
-            box = (px, py, px + w, py + h)
-            if not overlaps(box, occupied):
-                break
-        else:
-            continue
-        alpha = rgba[:, :, 3:4].astype(np.float32) / 255
-        region = view[py:py + h, px:px + w].astype(np.float32)
-        view[py:py + h, px:px + w] = (rgba[:, :, :3] * alpha + region * (1 - alpha)).astype(np.uint8)
-        occupied.append(box)
-        labels.append((name, box))
-
     if (width, height) != TRANSMITTED_VIEW_SIZE:
         view = cv2.resize(view, TRANSMITTED_VIEW_SIZE, interpolation=cv2.INTER_AREA)
-    factor = width / TRANSMITTED_VIEW_SIZE[0]
-    lines = []
-    for name, (bx1, by1, bx2, by2) in labels:
-        w, h = (bx2 - bx1) / factor, (by2 - by1) / factor
-        if max(w, h) < MIN_LABEL_PX:
-            continue
-        cxn = (bx1 + bx2) / 2 / factor / TRANSMITTED_VIEW_SIZE[0]
-        cyn = (by1 + by2) / 2 / factor / TRANSMITTED_VIEW_SIZE[1]
-        lines.append(f'{OBJECT_CLASSES.index(name)} {cxn:.6f} {cyn:.6f} '
-                     f'{w / TRANSMITTED_VIEW_SIZE[0]:.6f} {h / TRANSMITTED_VIEW_SIZE[1]:.6f}')
-    return view, lines
+    return view, yolo_lines(labels, width / TRANSMITTED_VIEW_SIZE[0])
+
+
+def load_recordings(sequences):
+    """[(png path, level, hand labels or None, mask boxes)] for the given sequences."""
+    out = []
+    for sequence in sequences:
+        for meta_path in sorted(glob.glob(str(sequence / '*_f*.json'))):
+            if meta_path.endswith(('.mask.json', '.labels.json')):
+                continue
+            level = json.load(open(meta_path))['view']['resolution_level']
+            labels_path = Path(meta_path.replace('.json', '.labels.json'))
+            mask_path = Path(meta_path.replace('.json', '.mask.json'))
+            labels = json.loads(labels_path.read_text()) if labels_path.exists() else None
+            masks = json.loads(mask_path.read_text()) if mask_path.exists() else []
+            out.append((meta_path.replace('.json', '.png'), level, labels, masks))
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def cached_background(png, masks_key):
+    """The recorded view with confident-but-unlabelled spots painted over."""
+    view = cv2.imread(png)
+    if masks_key:
+        mask = np.zeros(view.shape[:2], np.uint8)
+        for x1, y1, x2, y2 in json.loads(masks_key):
+            pad = 0.15 * max(x2 - x1, y2 - y1) + 2
+            cv2.rectangle(mask, (int(x1 - pad), int(y1 - pad)), (int(x2 + pad), int(y2 + pad)), 255, -1)
+        view = cv2.inpaint(view, mask, 5, cv2.INPAINT_TELEA)
+    return view
+
+
+def recorded_view(record, cutouts, rng):
+    png, level, hand_labels, masks = record
+    labels, occupied = [], []
+    if hand_labels is not None:
+        view = cv2.imread(png)
+        for a in hand_labels:
+            box = tuple(a['bbox'])
+            labels.append((a['object_id'], box))
+            occupied.append(box)
+    else:
+        view = cached_background(png, json.dumps(masks) if masks else '').copy()
+        occupied = [tuple(m) for m in masks]
+    if rng.random() < 0.5:                       # flips are free looking straight down
+        view, labels, occupied = flip(view, labels, occupied, horizontal=True)
+    if rng.random() < 0.5:
+        view, labels, occupied = flip(view, labels, occupied, horizontal=False)
+    paste_many(view, cutouts, level, rng, occupied, labels, downsample=DOWNSAMPLE[level])
+    return view, yolo_lines(labels, 1.0)
+
+
+def flip(view, labels, occupied, horizontal):
+    height, width = view.shape[:2]
+    if horizontal:
+        mirror = lambda b: (width - b[2], b[1], width - b[0], b[3])  # noqa: E731
+        view = np.ascontiguousarray(view[:, ::-1])
+    else:
+        mirror = lambda b: (b[0], height - b[3], b[2], height - b[1])  # noqa: E731
+        view = np.ascontiguousarray(view[::-1])
+    return view, [(n, mirror(b)) for n, b in labels], [mirror(b) for b in occupied]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('--train', type=int, default=3000)
+    parser.add_argument('--train', type=int, default=3000, help='helsinki-based train images')
     parser.add_argument('--val', type=int, default=300)
+    parser.add_argument('--rec-train', type=int, default=3000, help='recording-based train images')
+    parser.add_argument('--rec-val', type=int, default=200)
     parser.add_argument('--seed', type=int, default=0)
     arguments = parser.parse_args()
 
     rng = np.random.default_rng(arguments.seed)
     cutouts = load_cutouts()
     levels, weights = list(LEVEL_WEIGHTS), list(LEVEL_WEIGHTS.values())
-    splits = {'train': (arguments.train, range(0, 20)), 'val': (arguments.val, range(20, 25))}
-    for split, (count, frames) in splits.items():
+
+    # The largest recorded run trains; the others validate.
+    sequences = sorted((p for p in RECORDINGS.glob('*') if p.is_dir()),
+                       key=lambda p: -len(list(p.glob('*.png'))))
+    recordings = {'train': load_recordings(sequences[:1]), 'val': load_recordings(sequences[1:])}
+    if not recordings['val']:
+        recordings['val'] = recordings['train'][::10]
+    print({k: len(v) for k, v in recordings.items()}, 'recorded views;',
+          sum(r[2] is not None for r in recordings['train']), 'hand-labelled in train', flush=True)
+
+    plan = {'train': (arguments.train, range(0, 20), arguments.rec_train),
+            'val': (arguments.val, range(20, 25), arguments.rec_val)}
+    for split, (count, frames, rec_count) in plan.items():
         (OUT / 'images' / split).mkdir(parents=True, exist_ok=True)
         (OUT / 'labels' / split).mkdir(parents=True, exist_ok=True)
-        for i in range(count):
-            frame = int(rng.choice(list(frames)))
-            level = int(rng.choice(levels, p=weights))
-            view, lines = make_view(frame, level, cutouts, rng)
-            stem = f'{split}_{i:05d}_f{frame:02d}_L{level}'
+        jobs = [('h', i) for i in range(count)]
+        if recordings[split]:
+            jobs += [('r', i) for i in range(rec_count)]
+        for n, (kind, i) in enumerate(jobs):
+            if kind == 'h':
+                frame = int(rng.choice(list(frames)))
+                level = int(rng.choice(levels, p=weights))
+                view, lines = helsinki_view(frame, level, cutouts, rng)
+                stem = f'{split}_h{i:05d}_f{frame:02d}_L{level}'
+            else:
+                record = recordings[split][rng.integers(len(recordings[split]))]
+                view, lines = recorded_view(record, cutouts, rng)
+                stem = f'{split}_r{i:05d}_{Path(record[0]).stem}_L{record[1]}'
             cv2.imwrite(str(OUT / 'images' / split / f'{stem}.jpg'), view,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
             (OUT / 'labels' / split / f'{stem}.txt').write_text('\n'.join(lines))
-            if (i + 1) % 500 == 0:
-                print(f'{split}: {i + 1}/{count}', flush=True)
+            if (n + 1) % 1000 == 0:
+                print(f'{split}: {n + 1}/{len(jobs)}', flush=True)
 
     names = '\n'.join(f'  {i}: {n}' for i, n in enumerate(OBJECT_CLASSES))
     (OUT / 'data.yaml').write_text(
