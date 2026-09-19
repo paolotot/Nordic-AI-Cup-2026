@@ -1,4 +1,4 @@
-﻿"""Build a YOLO training set by copy-paste, from two kinds of background.
+"""Build a YOLO training set by copy-paste, from two kinds of background.
 
 1. helsinki views: a random camera view (level 0, 1 or 2) of a supplied 4K
    frame. Real objects keep their real labels; cutouts are pasted at source
@@ -50,6 +50,8 @@ DOWNSAMPLE = {0: 4, 1: 2, 2: 1}
 MIN_VISIBLE = 0.5      # label a real object if this much of it is in view
 MIN_LABEL_PX = 3       # drop labels smaller than this in the transmitted image
 NO_SHADOW_SHARE = 0.25
+REAL_SHARE = 0.7           # pastes of a class with real validation crops that use one
+LABELLED_SHARE = 0.5       # recording-based images built on a hand-labelled view
 
 
 def load_cutouts():
@@ -138,19 +140,26 @@ def sun(rng):
     return rng.uniform(0, 2 * np.pi), rng.uniform(0.15, 0.6), rng.uniform(0.3, 0.65)
 
 
-def paste_many(view, cutouts, level, rng, occupied, labels, downsample):
-    """Paste a level-appropriate number of cutouts, scaled down by `downsample`."""
+def paste_many(view, cutouts, level, rng, occupied, labels, downsample, real=None):
+    """Paste a level-appropriate number of cutouts, scaled down by `downsample`.
+    Classes with real validation crops use one of those most of the time."""
     height, width = view.shape[:2]
     light = sun(rng)
     low, high = PASTES_PER_VIEW[level]
     for _ in range(int(rng.integers(low, high + 1))):
         name = OBJECT_CLASSES[rng.integers(len(OBJECT_CLASSES))]
-        rgba, is_patch = cutouts[name][rng.integers(len(cutouts[name]))]
-        rgba = augment(rgba, is_patch, rng)
-        if downsample > 1:
-            h, w = rgba.shape[:2]
-            rgba = cv2.resize(np.ascontiguousarray(rgba), (max(2, round(w / downsample)), max(2, round(h / downsample))),
-                              interpolation=cv2.INTER_AREA)
+        is_real = bool(real and real.get(name)) and rng.random() < REAL_SHARE
+        if is_real:
+            crop, scale = real[name][rng.integers(len(real[name]))]
+            rgba, is_patch = real_variant(crop, scale, downsample, rng), True
+        else:
+            rgba, is_patch = cutouts[name][rng.integers(len(cutouts[name]))]
+            rgba = augment(rgba, is_patch, rng)
+            if downsample > 1:
+                h, w = rgba.shape[:2]
+                rgba = cv2.resize(np.ascontiguousarray(rgba),
+                                  (max(2, round(w / downsample)), max(2, round(h / downsample))),
+                                  interpolation=cv2.INTER_AREA)
         h, w = rgba.shape[:2]
         if w >= width or h >= height:
             continue
@@ -162,7 +171,7 @@ def paste_many(view, cutouts, level, rng, occupied, labels, downsample):
         else:
             continue
         shadow = None
-        if light is not None:
+        if light is not None and not is_real:          # real crops carry their own shadow
             angle, length, strength = light
             reach = length * max(h, w)
             shadow = (np.cos(angle) * reach, np.sin(angle) * reach,
@@ -190,7 +199,7 @@ def cached_frame(frame):
     return load_frame(frame)
 
 
-def helsinki_view(frame, level, cutouts, rng):
+def helsinki_view(frame, level, cutouts, rng, real=None):
     image = cached_frame(frame)
     min_x, max_x, min_y, max_y = center_bounds_for_level(level)
     cx, cy = int(rng.integers(min_x, max_x + 1)), int(rng.integers(min_y, max_y + 1))
@@ -209,25 +218,81 @@ def helsinki_view(frame, level, cutouts, rng):
             labels.append((a['object_id'], (inter[0] - x1, inter[1] - y1,
                                             inter[2] - x1, inter[3] - y1)))
 
-    paste_many(view, cutouts, level, rng, occupied, labels, downsample=1)
+    paste_many(view, cutouts, level, rng, occupied, labels, downsample=1, real=real)
     height, width = view.shape[:2]
     if (width, height) != TRANSMITTED_VIEW_SIZE:
         view = cv2.resize(view, TRANSMITTED_VIEW_SIZE, interpolation=cv2.INTER_AREA)
     return view, yolo_lines(labels, width / TRANSMITTED_VIEW_SIZE[0])
 
 
-def load_recordings(sequences):
+def load_holdout():
+    """Labelled views kept out of training for tools/eval_views.py."""
+    path = RECORDINGS / 'holdout.json'
+    return set(json.loads(path.read_text())) if path.exists() else set()
+
+
+def load_real_crops(records):
+    """Real validation objects cut from hand-labelled views: {class: [(rgba, scale)]}.
+
+    `scale` is the view's downsample factor, so a crop can be pasted at the
+    right size into a view of any level. Box edges fade out over a few pixels.
+    """
+    crops = {}
+    for png, level, labels, _ in records:
+        if not labels:
+            continue
+        view = cv2.imread(png)
+        height, width = view.shape[:2]
+        for a in labels:
+            x1, y1, x2, y2 = (int(round(c)) for c in a['bbox'])
+            pad = 3
+            x1, y1, x2, y2 = max(0, x1 - pad), max(0, y1 - pad), min(width, x2 + pad), min(height, y2 + pad)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            crop = view[y1:y2, x1:x2]
+            h, w = crop.shape[:2]
+            fade_y = np.clip(np.minimum(np.arange(h), np.arange(h)[::-1]) / pad, 0, 1)
+            fade_x = np.clip(np.minimum(np.arange(w), np.arange(w)[::-1]) / pad, 0, 1)
+            alpha = (np.outer(fade_y, fade_x) * 255).astype(np.uint8)
+            crops.setdefault(a['object_id'], []).append((np.dstack([crop, alpha]), DOWNSAMPLE[level]))
+    return crops
+
+
+def real_variant(rgba, scale, downsample, rng):
+    """Flip/turn/relight a real crop and size it for a view downsampled by `downsample`."""
+    if rng.random() < 0.5:
+        rgba = rgba[:, ::-1]
+    if rng.random() < 0.5:
+        rgba = rgba[::-1]
+    rgba = np.ascontiguousarray(np.rot90(rgba, rng.integers(4)))
+    factor = scale / downsample * rng.uniform(0.85, 1.2)
+    h, w = rgba.shape[:2]
+    rgba = cv2.resize(rgba, (max(2, round(w * factor)), max(2, round(h * factor))),
+                      interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_LINEAR)
+    colour = rgba[:, :, :3].astype(np.float32) * rng.uniform(0.85, 1.15) + rng.uniform(-10, 10)
+    rgba[:, :, :3] = np.clip(colour, 0, 255).astype(np.uint8)
+    return rgba
+
+
+def load_recordings(sequences, exclude=frozenset()):
     """[(png path, level, hand labels or None, mask boxes)] for the given sequences."""
     out = []
     for sequence in sequences:
         for meta_path in sorted(glob.glob(str(sequence / '*_f*.json'))):
-            if meta_path.endswith(('.mask.json', '.labels.json')):
+            if meta_path.endswith(('.mask.json', '.labels.json', '.ignore.json')):
+                continue
+            if f'{sequence.name}/{Path(meta_path).stem}' in exclude:
                 continue
             level = json.load(open(meta_path))['view']['resolution_level']
             labels_path = Path(meta_path.replace('.json', '.labels.json'))
             mask_path = Path(meta_path.replace('.json', '.mask.json'))
+            ignore_path = Path(meta_path.replace('.json', '.ignore.json'))
             labels = json.loads(labels_path.read_text()) if labels_path.exists() else None
-            masks = json.loads(mask_path.read_text()) if mask_path.exists() else []
+            if labels is not None:
+                # Hand-labelled: only the spots marked unsure get painted over.
+                masks = json.loads(ignore_path.read_text()) if ignore_path.exists() else []
+            else:
+                masks = json.loads(mask_path.read_text()) if mask_path.exists() else []
             out.append((meta_path.replace('.json', '.png'), level, labels, masks))
     return out
 
@@ -245,23 +310,20 @@ def cached_background(png, masks_key):
     return view
 
 
-def recorded_view(record, cutouts, rng):
+def recorded_view(record, cutouts, rng, real=None):
     png, level, hand_labels, masks = record
     labels, occupied = [], []
-    if hand_labels is not None:
-        view = cv2.imread(png)
-        for a in hand_labels:
-            box = tuple(a['bbox'])
-            labels.append((a['object_id'], box))
-            occupied.append(box)
-    else:
-        view = cached_background(png, json.dumps(masks) if masks else '').copy()
-        occupied = [tuple(m) for m in masks]
+    view = cached_background(png, json.dumps(masks) if masks else '').copy()
+    occupied = [tuple(m) for m in masks]
+    for a in hand_labels or []:
+        box = tuple(a['bbox'])
+        labels.append((a['object_id'], box))
+        occupied.append(box)
     if rng.random() < 0.5:                       # flips are free looking straight down
         view, labels, occupied = flip(view, labels, occupied, horizontal=True)
     if rng.random() < 0.5:
         view, labels, occupied = flip(view, labels, occupied, horizontal=False)
-    paste_many(view, cutouts, level, rng, occupied, labels, downsample=DOWNSAMPLE[level])
+    paste_many(view, cutouts, level, rng, occupied, labels, downsample=DOWNSAMPLE[level], real=real)
     return view, yolo_lines(labels, 1.0)
 
 
@@ -278,9 +340,9 @@ def flip(view, labels, occupied, horizontal):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('--train', type=int, default=3000, help='helsinki-based train images')
+    parser.add_argument('--train', type=int, default=1500, help='helsinki-based train images')
     parser.add_argument('--val', type=int, default=300)
-    parser.add_argument('--rec-train', type=int, default=3000, help='recording-based train images')
+    parser.add_argument('--rec-train', type=int, default=4500, help='recording-based train images')
     parser.add_argument('--rec-val', type=int, default=200)
     parser.add_argument('--seed', type=int, default=0)
     arguments = parser.parse_args()
@@ -289,14 +351,20 @@ def main():
     cutouts = load_cutouts()
     levels, weights = list(LEVEL_WEIGHTS), list(LEVEL_WEIGHTS.values())
 
-    # The largest recorded run trains; the others validate.
+    # The largest recorded run trains; the others validate. Held-out labelled
+    # views (tools/eval_views.py) are used for nothing here.
     sequences = sorted((p for p in RECORDINGS.glob('*') if p.is_dir()),
                        key=lambda p: -len(list(p.glob('*.png'))))
-    recordings = {'train': load_recordings(sequences[:1]), 'val': load_recordings(sequences[1:])}
+    holdout = load_holdout()
+    recordings = {'train': load_recordings(sequences[:1], holdout),
+                  'val': load_recordings(sequences[1:], holdout)}
     if not recordings['val']:
         recordings['val'] = recordings['train'][::10]
+    labelled = {split: [r for r in recs if r[2] is not None] for split, recs in recordings.items()}
+    real = load_real_crops(labelled['train'])
     print({k: len(v) for k, v in recordings.items()}, 'recorded views;',
-          sum(r[2] is not None for r in recordings['train']), 'hand-labelled in train', flush=True)
+          len(labelled['train']), 'hand-labelled in train;', len(holdout), 'held out;',
+          sum(len(v) for v in real.values()), 'real crops over', len(real), 'classes', flush=True)
 
     plan = {'train': (arguments.train, range(0, 20), arguments.rec_train),
             'val': (arguments.val, range(20, 25), arguments.rec_val)}
@@ -310,11 +378,13 @@ def main():
             if kind == 'h':
                 frame = int(rng.choice(list(frames)))
                 level = int(rng.choice(levels, p=weights))
-                view, lines = helsinki_view(frame, level, cutouts, rng)
+                view, lines = helsinki_view(frame, level, cutouts, rng, real)
                 stem = f'{split}_h{i:05d}_f{frame:02d}_L{level}'
             else:
-                record = recordings[split][rng.integers(len(recordings[split]))]
-                view, lines = recorded_view(record, cutouts, rng)
+                pool = (labelled[split] if labelled[split] and rng.random() < LABELLED_SHARE
+                        else recordings[split])
+                record = pool[rng.integers(len(pool))]
+                view, lines = recorded_view(record, cutouts, rng, real)
                 stem = f'{split}_r{i:05d}_{Path(record[0]).stem}_L{record[1]}'
             cv2.imwrite(str(OUT / 'images' / split / f'{stem}.jpg'), view,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])

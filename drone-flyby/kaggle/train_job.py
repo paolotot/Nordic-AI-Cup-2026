@@ -18,7 +18,7 @@ RECORDINGS = Path('/kaggle/input/drone-flyby-recordings')
 WORK = Path('/tmp/work')
 OUTPUT = Path('/kaggle/working')
 # (model, epochs, batch). Both T4s are used together; early stopping may end sooner.
-RUNS = [('yolo11s', 40, 32), ('yolo11n', 40, 32)]
+RUNS = [('yolo11n', 50, 32), ('yolo11s', 40, 32)]
 
 
 def sh(command, cwd=None):
@@ -35,6 +35,9 @@ def copy_recordings(target):
         for sibling in png.parent.glob(png.stem + '*'):
             shutil.copy(sibling, folder / sibling.name)
         count += 1
+    # The held-out labelled views must stay out of training there too.
+    for holdout in RECORDINGS.rglob('holdout.json'):
+        shutil.copy(holdout, target / 'holdout.json')
     print(f'copied {count} recorded views', flush=True)
 
 

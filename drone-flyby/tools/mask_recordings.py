@@ -31,7 +31,7 @@ def main():
     model = YOLO(arguments.weights, task='detect')
     total, masked = 0, 0
     for path in sorted(glob.glob(str(Path(arguments.recordings) / '*' / '*_f*.json'))):
-        if path.endswith(('.mask.json', '.labels.json')):
+        if path.endswith(('.mask.json', '.labels.json', '.ignore.json')):
             continue
         image = cv2.imread(path.replace('.json', '.png'))
         result = model.predict(image, imgsz=(544, 960), conf=arguments.confidence,
